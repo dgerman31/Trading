@@ -1,0 +1,403 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// Session Liquidity Sweep + 1m FVG Reversal. See STRATEGY.md for the full rules.
+// Use on a 1-minute NQ/MNQ chart. Times are New York.
+//@version=5
+strategy("Session Sweep + 1m FVG", shorttitle="SweepFVG", overlay=true,
+     initial_capital=50000, default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=2.25,
+     slippage=1
+     max_lines_count=500
+     max_labels_count=500
+     max_boxes_count=500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+tz        = "America/New_York"
+gS = "Sessions (New York time)"
+sAsia     = input.session("2000-0000", "Asia range",        group=gS)
+sLon      = input.session("0200-0500", "London range",      group=gS)
+sPM       = input.session("0800-0930", "Pre-market range",  group=gS)
+sRTH      = input.session("0930-1600", "RTH (for PDH/PDL)", group=gS)
+sWin      = input.session("0930-1130", "Entry window",      group=gS)
+flatHHMM  = input.int(1200, "Flat at (HHMM)", group=gS)
+
+gL = "Levels to trade"
+useAsia   = input.bool(true, "Sweep of Asia high/low",     group=gL)
+useLon    = input.bool(true, "Sweep of London high/low",   group=gL)
+usePD     = input.bool(true, "Sweep of prior-day high/low", group=gL)
+minOvr    = input.float(50,  "Min overnight range (pts, 0=off)", group=gL)
+maxOvr    = input.float(300, "Max overnight range (pts, 0=off)", group=gL)
+
+gE = "Entry"
+reqMSS    = input.bool(true, "Require market structure shift", group=gE)
+entryMode = input.string("FVG edge", "Entry price", options=["FVG edge", "FVG midpoint"], group=gE)
+bodyFrac  = input.float(0.6, "Displacement: min body/range", step=0.05, group=gE)
+rngMult   = input.float(1.0, "Displacement: min range x avg(10)", step=0.1, group=gE)
+armBars   = input.int(30, "Bars after sweep to find setup", group=gE)
+expBars   = input.int(15, "Cancel unfilled order after (bars)", group=gE)
+
+gR = "Risk & targets"
+targetMode = input.string("Draw on liquidity", "Target", options=["Draw on liquidity", "Fixed R"], group=gR)
+minRR     = input.float(2.0, "Min R:R (liquidity target)", step=0.25, group=gR)
+fixedRR   = input.float(2.0, "Fixed R:R", step=0.25, group=gR)
+fallback  = input.bool(false, "If no pool >= min R:R, use fixed R", group=gR)
+stopBufT  = input.int(2, "Stop buffer (ticks)", group=gR)
+tgtBufT   = input.int(2, "Target buffer (ticks)", group=gR)
+minStop   = input.float(5,  "Min stop (pts)", group=gR)
+maxStop   = input.float(40, "Max stop (pts)", group=gR)
+sizing    = input.string("Fixed contracts", "Sizing", options=["Fixed contracts", "Risk $"], group=gR)
+qtyFixed  = input.int(1, "Contracts", minval=1, group=gR)
+riskUsd   = input.float(500, "Risk per trade ($)", group=gR)
+maxTrades = input.int(2, "Max trades / day", group=gR)
+maxLosses = input.int(2, "Max losses / day", group=gR)
+stopOnWin = input.bool(true, "Stop for the day after a win", group=gR)
+
+gV = "Visuals"
+showLv    = input.bool(true, "Plot session levels", group=gV)
+
+// ───────────────────────────── Helpers ─────────────────────────────
+inSess(s) => not na(time(timeframe.period, s, tz))
+tick      = syminfo.mintick
+inAsia    = inSess(sAsia)
+inLon     = inSess(sLon)
+inPM      = inSess(sPM)
+inRTH     = inSess(sRTH)
+inWin     = inSess(sWin)
+hhmm      = hour(time, tz) * 100 + minute(time, tz)
+afterFlat = inRTH and hhmm >= flatHHMM
+rthStart  = inRTH and not inRTH[1]
+
+// ───────────────────── Session range tracking ─────────────────────
+var float curAH = na
+var float curAL = na
+var float asiaH = na
+var float asiaL = na
+var float curLH = na
+var float curLL = na
+var float lonH = na
+var float lonL = na
+var float curPH = na
+var float curPL = na
+var float pmH = na
+var float pmL = na
+var float curRH = na
+var float curRL = na
+var float pdh = na
+var float pdl = na
+// highs/lows printed AFTER each level formed (to know if it was already taken pre-open)
+var float postAH = na
+var float postAL = na
+var float postLH = na
+var float postLL = na
+var float postRH = na
+var float postRL = na
+
+if inAsia
+    curAH := inAsia[1] ? math.max(curAH, high) : high
+    curAL := inAsia[1] ? math.min(curAL, low)  : low
+else if inAsia[1]
+    asiaH := curAH
+    asiaL := curAL
+    postAH := high
+    postAL := low
+else
+    postAH := math.max(postAH, high)
+    postAL := math.min(postAL, low)
+
+if inLon
+    curLH := inLon[1] ? math.max(curLH, high) : high
+    curLL := inLon[1] ? math.min(curLL, low)  : low
+else if inLon[1]
+    lonH := curLH
+    lonL := curLL
+    postLH := high
+    postLL := low
+else
+    postLH := math.max(postLH, high)
+    postLL := math.min(postLL, low)
+
+if inPM
+    curPH := inPM[1] ? math.max(curPH, high) : high
+    curPL := inPM[1] ? math.min(curPL, low)  : low
+
+if inRTH
+    curRH := inRTH[1] ? math.max(curRH, high) : high
+    curRL := inRTH[1] ? math.min(curRL, low)  : low
+else if inRTH[1]
+    pdh := curRH
+    pdl := curRL
+    postRH := high
+    postRL := low
+else
+    postRH := math.max(postRH, high)
+    postRL := math.min(postRL, low)
+
+// ───────────────────── Swing structure (1m) ─────────────────────
+ph = ta.pivothigh(high, 2, 2)
+pl = ta.pivotlow(low, 2, 2)
+var float lastPH = na
+var float lastPL = na
+var swH = array.new_float()
+var swL = array.new_float()
+if inPM and not inPM[1]
+    array.clear(swH), array.clear(swL)
+if not na(ph)
+    lastPH := ph
+    array.push(swH, ph)
+if not na(pl)
+    lastPL := pl
+    array.push(swL, pl)
+// drop swings that have been traded through (no longer liquidity)
+if array.size(swH) > 0
+    for k = array.size(swH) - 1 to 0
+        if high >= array.get(swH, k)
+            array.remove(swH, k)
+if array.size(swL) > 0
+    for k = array.size(swL) - 1 to 0
+        if low <= array.get(swL, k)
+            array.remove(swL, k)
+
+hh10 = ta.highest(high, 10)
+ll10 = ta.lowest(low, 10)
+avgR = ta.sma(high - low, 10)
+
+// ───────────────────── Daily state at 09:30 ─────────────────────
+// sweep flags (level swept by >= 1 tick) and target flags (level touched)
+var bool aLsw = true
+var bool lLsw = true
+var bool pdlSw = true
+var bool aHsw = true
+var bool lHsw = true
+var bool pdhSw = true
+var bool aHt = true
+var bool lHt = true
+var bool pdhT = true
+var bool pmHt = true
+var bool aLt = true
+var bool lLt = true
+var bool pdlT = true
+var bool pmLt = true
+var bool dayOK = false
+var int tradesToday = 0
+var int winsToday = 0
+var int lossesToday = 0
+
+if rthStart
+    pmH := curPH[1]
+    pmL := curPL[1]
+    // a level already touched between its formation and the open is spent
+    aLsw := not useAsia or na(asiaL) or postAL[1] <= asiaL
+    aHsw := not useAsia or na(asiaH) or postAH[1] >= asiaH
+    lLsw := not useLon or na(lonL) or postLL[1] <= lonL
+    lHsw := not useLon or na(lonH) or postLH[1] >= lonH
+    pdlSw := not usePD or na(pdl) or postRL[1] <= pdl
+    pdhSw := not usePD or na(pdh) or postRH[1] >= pdh
+    aHt := na(asiaH) or postAH[1] >= asiaH
+    aLt := na(asiaL) or postAL[1] <= asiaL
+    lHt := na(lonH) or postLH[1] >= lonH
+    lLt := na(lonL) or postLL[1] <= lonL
+    pdhT := na(pdh) or postRH[1] >= pdh
+    pdlT := na(pdl) or postRL[1] <= pdl
+    pmHt := na(pmH)
+    pmLt := na(pmL)
+    ovr = math.max(asiaH, lonH) - math.min(asiaL, lonL)
+    dayOK := not na(ovr) and (minOvr <= 0 or ovr >= minOvr) and (maxOvr <= 0 or ovr <= maxOvr)
+    tradesToday := 0
+    winsToday := 0
+    lossesToday := 0
+
+// targets touched during the session are no longer pools
+if inRTH
+    aHt  := aHt  or high >= asiaH
+    lHt := lHt or high >= lonH
+    pdhT := pdhT or high >= pdh
+    pmHt := pmHt or high >= pmH
+    aLt  := aLt  or low <= asiaL
+    lLt := lLt or low <= lonL
+    pdlT := pdlT or low <= pdl
+    pmLt := pmLt or low <= pmL
+
+// sweeps (always tracked so a level can only be traded once)
+st = 1 * tick
+sweptLowNow  = inWin and ((not aLsw and low <= asiaL - st) or (not lLsw and low <= lonL - st) or (not pdlSw and low <= pdl - st))
+sweptHighNow = inWin and ((not aHsw and high >= asiaH + st) or (not lHsw and high >= lonH + st) or (not pdhSw and high >= pdh + st))
+if inWin
+    aLsw  := aLsw  or low <= asiaL - st
+    lLsw := lLsw or low <= lonL - st
+    pdlSw := pdlSw or low <= pdl - st
+    aHsw  := aHsw  or high >= asiaH + st
+    lHsw := lHsw or high >= lonH + st
+    pdhSw := pdhSw or high >= pdh + st
+
+// ───────────────────── Trade bookkeeping ─────────────────────
+if strategy.closedtrades > strategy.closedtrades[1]
+    p = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    tradesToday += 1
+    if p > 0
+        winsToday += 1
+    else
+        lossesToday += 1
+
+var int pendDir = 0
+var int pendExp = na
+var float pendTgt = na
+if strategy.position_size != 0
+    pendDir := 0
+if pendDir != 0 and strategy.position_size == 0
+    if bar_index > pendExp or not inWin or (pendDir == 1 and high >= pendTgt) or (pendDir == -1 and low <= pendTgt)
+        strategy.cancel(pendDir == 1 ? "Long" : "Short")
+        pendDir := 0
+
+if afterFlat
+    strategy.cancel_all()
+    strategy.close_all(comment="Time")
+    pendDir := 0
+
+done      = tradesToday >= maxTrades or lossesToday >= maxLosses or (stopOnWin and winsToday > 0)
+canSignal = dayOK and inWin and not done and strategy.position_size == 0 and pendDir == 0
+
+// target pickers (nearest pool giving >= minDist)
+pickUp(best, lvl, spent, entry, minDist) =>
+    c = lvl - tgtBufT * tick
+    ok = not spent and not na(lvl) and c - entry >= minDist
+    ok ? (na(best) ? c : math.min(best, c)) : best
+pickDn(best, lvl, spent, entry, minDist) =>
+    c = lvl + tgtBufT * tick
+    ok = not spent and not na(lvl) and entry - c >= minDist
+    ok ? (na(best) ? c : math.max(best, c)) : best
+
+qtyFor(risk) => sizing == "Risk $" ? math.floor(riskUsd / (risk * syminfo.pointvalue)) : qtyFixed
+
+// ───────────────────── Long: sweep of a low ─────────────────────
+var bool armL = false
+var int swIdxL = na
+var float extL = na
+var int extIdxL = na
+var float mssLvlL = na
+var bool mssL = false
+if not canSignal
+    armL := false
+if canSignal and sweptLowNow and not armL
+    armL := true
+    swIdxL := bar_index
+    extL := low
+    extIdxL := bar_index
+    mssL := false
+    mssLvlL := na(lastPH) ? hh10[1] : lastPH
+if canSignal and armL
+    if low < extL
+        extL := low
+        extIdxL := bar_index
+        mssL := false
+        mssLvlL := na(lastPH) ? hh10[1] : lastPH
+    if bar_index - swIdxL > armBars
+        armL := false
+    if bar_index > extIdxL and close > mssLvlL
+        mssL := true
+    dispL = close[1] > open[1] and (close[1] - open[1]) >= bodyFrac * (high[1] - low[1]) and (high[1] - low[1]) >= rngMult * nz(avgR[2])
+    fvgL  = armL and bar_index - 2 >= extIdxL and low > high[2] and dispL
+    if fvgL and (not reqMSS or mssL)
+        e  = entryMode == "FVG edge" ? low : (low + high[2]) / 2
+        e := math.round_to_mintick(e)
+        sl = extL - stopBufT * tick
+        r  = e - sl
+        if r >= minStop and r <= maxStop
+            tp = float(na)
+            if targetMode == "Fixed R"
+                tp := e + fixedRR * r
+            else
+                md = minRR * r
+                tp := pickUp(tp, asiaH, aHt, e, md)
+                tp := pickUp(tp, lonH, lHt, e, md)
+                tp := pickUp(tp, pdh, pdhT, e, md)
+                tp := pickUp(tp, pmH, pmHt, e, md)
+                if array.size(swH) > 0
+                    for k = 0 to array.size(swH) - 1
+                        tp := pickUp(tp, array.get(swH, k), false, e, md)
+                if na(tp) and fallback
+                    tp := e + fixedRR * r
+            q = qtyFor(r)
+            if not na(tp) and q >= 1
+                strategy.entry("Long", strategy.long, qty=q, limit=e)
+                strategy.exit("Long X", "Long", stop=sl, limit=tp)
+                pendDir := 1
+                pendExp := bar_index + expBars
+                pendTgt := tp
+                box.new(bar_index - 2, low, bar_index + expBars, high[2], border_color=color.new(color.teal, 40), bgcolor=color.new(color.teal, 85))
+                line.new(bar_index, sl, bar_index + 30, sl, color=color.red)
+                line.new(bar_index, tp, bar_index + 30, tp, color=color.lime)
+                alert("SweepFVG LONG limit " + str.tostring(e) + " stop " + str.tostring(sl) + " target " + str.tostring(tp), alert.freq_once_per_bar_close)
+        armL := false
+
+// ───────────────────── Short: sweep of a high ─────────────────────
+var bool armS = false
+var int swIdxS = na
+var float extS = na
+var int extIdxS = na
+var float mssLvlS = na
+var bool mssS = false
+canSignalS = canSignal and pendDir == 0
+if not canSignalS
+    armS := false
+if canSignalS and sweptHighNow and not armS
+    armS := true
+    swIdxS := bar_index
+    extS := high
+    extIdxS := bar_index
+    mssS := false
+    mssLvlS := na(lastPL) ? ll10[1] : lastPL
+if canSignalS and armS
+    if high > extS
+        extS := high
+        extIdxS := bar_index
+        mssS := false
+        mssLvlS := na(lastPL) ? ll10[1] : lastPL
+    if bar_index - swIdxS > armBars
+        armS := false
+    if bar_index > extIdxS and close < mssLvlS
+        mssS := true
+    dispS = close[1] < open[1] and (open[1] - close[1]) >= bodyFrac * (high[1] - low[1]) and (high[1] - low[1]) >= rngMult * nz(avgR[2])
+    fvgS  = armS and bar_index - 2 >= extIdxS and high < low[2] and dispS
+    if fvgS and (not reqMSS or mssS)
+        e  = entryMode == "FVG edge" ? high : (high + low[2]) / 2
+        e := math.round_to_mintick(e)
+        sl = extS + stopBufT * tick
+        r  = sl - e
+        if r >= minStop and r <= maxStop
+            tp = float(na)
+            if targetMode == "Fixed R"
+                tp := e - fixedRR * r
+            else
+                md = minRR * r
+                tp := pickDn(tp, asiaL, aLt, e, md)
+                tp := pickDn(tp, lonL, lLt, e, md)
+                tp := pickDn(tp, pdl, pdlT, e, md)
+                tp := pickDn(tp, pmL, pmLt, e, md)
+                if array.size(swL) > 0
+                    for k = 0 to array.size(swL) - 1
+                        tp := pickDn(tp, array.get(swL, k), false, e, md)
+                if na(tp) and fallback
+                    tp := e - fixedRR * r
+            q = qtyFor(r)
+            if not na(tp) and q >= 1
+                strategy.entry("Short", strategy.short, qty=q, limit=e)
+                strategy.exit("Short X", "Short", stop=sl, limit=tp)
+                pendDir := -1
+                pendExp := bar_index + expBars
+                pendTgt := tp
+                box.new(bar_index - 2, low[2], bar_index + expBars, high, border_color=color.new(color.maroon, 40), bgcolor=color.new(color.maroon, 85))
+                line.new(bar_index, sl, bar_index + 30, sl, color=color.red)
+                line.new(bar_index, tp, bar_index + 30, tp, color=color.lime)
+                alert("SweepFVG SHORT limit " + str.tostring(e) + " stop " + str.tostring(sl) + " target " + str.tostring(tp), alert.freq_once_per_bar_close)
+        armS := false
+
+// ───────────────────── Visuals ─────────────────────
+showNow = showLv and inRTH
+plot(showNow ? asiaH : na, "Asia H",   color.new(color.orange, 0),  1, plot.style_linebr)
+plot(showNow ? asiaL : na, "Asia L",   color.new(color.orange, 0),  1, plot.style_linebr)
+plot(showNow ? lonH  : na, "London H", color.new(color.blue, 0),    1, plot.style_linebr)
+plot(showNow ? lonL  : na, "London L", color.new(color.blue, 0),    1, plot.style_linebr)
+plot(showNow ? pdh   : na, "PDH",      color.new(color.gray, 0),    1, plot.style_linebr)
+plot(showNow ? pdl   : na, "PDL",      color.new(color.gray, 0),    1, plot.style_linebr)
+plotshape(sweptLowNow,  "Low swept",  shape.triangleup,   location.belowbar, color.teal,   size=size.tiny)
+plotshape(sweptHighNow, "High swept", shape.triangledown, location.abovebar, color.maroon, size=size.tiny)
+bgcolor(inWin ? color.new(color.yellow, 94) : na, title="Entry window")
